@@ -15,9 +15,16 @@ export default function SearchBatchPanel({ docId, codes, onApplied, onError }) {
   const [applying, setApplying] = useState(false)
   const [result, setResult] = useState(null) // {created: [...], skipped: [...]}
   const selectAllRef = useRef(null)
+  // 检索 / 批量应用的异步错位守卫：只接受最新一次、且仍属当前文档的响应
+  const reqSeqRef = useRef(0)
+  const docIdRef = useRef(docId)
+  useEffect(() => {
+    docIdRef.current = docId
+  }, [docId])
 
   // 切换文档后清空检索状态
   useEffect(() => {
+    reqSeqRef.current++ // 使切文档前在途的检索响应失效
     setQuery('')
     setMatches(null)
     setChecked(new Set())
@@ -40,17 +47,21 @@ export default function SearchBatchPanel({ docId, codes, onApplied, onError }) {
   async function handleSearch(ev) {
     ev.preventDefault()
     if (!query || searching) return
+    const targetDocId = docId
+    const seq = ++reqSeqRef.current
     setSearching(true)
     setResult(null)
     try {
-      const data = await api.searchDocument(docId, query)
+      const data = await api.searchDocument(targetDocId, query)
+      // 又发起了新检索或已切到其它文档：迟到结果丢弃
+      if (seq !== reqSeqRef.current || docIdRef.current !== targetDocId) return
       setMatches(data.matches)
       // 默认全选，便于直接批量编码；可再逐项取消
       setChecked(new Set(data.matches.map((_, i) => i)))
     } catch (e) {
-      onError(e)
+      if (seq === reqSeqRef.current && docIdRef.current === targetDocId) onError(e)
     } finally {
-      setSearching(false)
+      if (seq === reqSeqRef.current && docIdRef.current === targetDocId) setSearching(false)
     }
   }
 
@@ -70,20 +81,26 @@ export default function SearchBatchPanel({ docId, codes, onApplied, onError }) {
 
   async function handleApply() {
     if (!codeChoice || selectedItems.length === 0 || applying) return
+    // 提交目标锁定为发起时的文档，区间与该文档检索结果一一对应
+    const targetDocId = docId
+    const items = selectedItems.map((m) => ({ start: m.start, end: m.end }))
+    const seq = ++reqSeqRef.current
     setApplying(true)
     try {
       const data = await api.batchCreateCodings({
-        document_id: docId,
+        document_id: targetDocId,
         code_id: Number(codeChoice),
-        items: selectedItems.map((m) => ({ start: m.start, end: m.end })),
+        items,
       })
+      // 在途期间切走了文档：结果不落在新文档面板（全局刷新亦由守卫忽略旧响应）
+      if (seq !== reqSeqRef.current || docIdRef.current !== targetDocId) return
       setResult(data)
       await onApplied()
     } catch (e) {
       // 任一非法项时后端整批回滚，这里只提示，无需本地清理
-      onError(e)
+      if (seq === reqSeqRef.current && docIdRef.current === targetDocId) onError(e)
     } finally {
-      setApplying(false)
+      if (seq === reqSeqRef.current && docIdRef.current === targetDocId) setApplying(false)
     }
   }
 

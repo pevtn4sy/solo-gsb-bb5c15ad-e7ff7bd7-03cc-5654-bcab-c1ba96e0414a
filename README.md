@@ -106,6 +106,7 @@ docker compose up --build
   - **证据逐条列出**：每条证据含关联时保存的**编码名、区间 `[start, end)`、原文摘录快照**与**当前有效 / 已变化 / 已删除**状态及关联时间；**已变化**时追加当前编码、当前区间与当前原文摘录；**已删除**时仅展示快照并注明原标注已删除、快照未丢失；
   - 所有用户内容（标题、文档名、编码名、摘录）均经行内转义（反斜杠 / 反引号 / 竖线 / 换行）或代码围栏隔离，无法伪造标题、代码围栏或表格结构。
   - 对应 `GET /api/documents/{id}/memos/{memoId}/export`（`text/markdown` 附件下载）。
+- **文档切换的异步守卫**：文档读取与刷新均带「当前文档 + 请求次序」双重校验——每次请求取单调递增序号，响应落地前同时校验「仍是最新一次请求」与「仍属当前文档」，切到其它文档或又发起刷新时，旧文档 / 旧批次的迟到响应一律丢弃，只展示当前文档的最新结果；切换加载期间内容区回到加载态（顶栏切换器仍可用），旧正文、侧栏与编码表单不会对新文档产生任何操作；标注预览与冲突确认绑定发起时的文档与正文快照，跨过文档切换（或迁移改变正文）即失效，提交目标始终使用预览时捕获的文档 id，绝不会按 A 文档的区间写到 B 文档。前端附带 jsdom 竞态回归测试：`cd frontend && npm run test:race`。
 - **持久化**：所有文档、编码本、标注、抽样复核批次与分析备忘录（含证据快照）均存于 SQLite，刷新页面后原样恢复；首次启动自动载入一份示例访谈与编码。
 
 ## 本地开发（不用 Docker）
@@ -180,6 +181,7 @@ npm run dev   # http://localhost:5173
     ├── Dockerfile          # 多阶段构建：Vite build → nginx
     ├── nginx.conf          # 静态托管 + /api 反向代理
     └── src/
-        ├── App.jsx         # 状态编排与冲突决策流
+        ├── App.jsx         # 状态编排与冲突决策流（文档读取 / 刷新的次序守卫）
+        ├── useStaleGuard.js # 异步错位守卫：请求序号 + 当前文档校验
         └── components/     # TextView / CodingForm / SearchBatchPanel / ImportDialog / MigrationDialog / ConflictDialog / Sidebar / CooccurrenceView / SpeakerView / DistributionView / GapView / TransitionView / ReviewView / MemoView
 ```
