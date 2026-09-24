@@ -15,9 +15,15 @@ export default function SearchBatchPanel({ docId, codes, onApplied, onError }) {
   const [applying, setApplying] = useState(false)
   const [result, setResult] = useState(null) // {created: [...], skipped: [...]}
   const selectAllRef = useRef(null)
+  // 检索请求序号：发起新检索或切换文档时，在途的旧检索失效；
+  // docIdRef 始终指向当前文档，用于让跨文档切换的迟到响应落地失效
+  const reqSeq = useRef(0)
+  const docIdRef = useRef(docId)
 
-  // 切换文档后清空检索状态
+  // 切换文档后清空检索状态，并使在途的检索 / 批量提交结果落地失效
   useEffect(() => {
+    docIdRef.current = docId
+    reqSeq.current++
     setQuery('')
     setMatches(null)
     setChecked(new Set())
@@ -40,17 +46,21 @@ export default function SearchBatchPanel({ docId, codes, onApplied, onError }) {
   async function handleSearch(ev) {
     ev.preventDefault()
     if (!query || searching) return
+    const seq = ++reqSeq.current
     setSearching(true)
     setResult(null)
     try {
       const data = await api.searchDocument(docId, query)
+      // 检索在途期间切换文档或发起新检索：迟到的旧结果直接丢弃，
+      // 不会把上一篇文档的命中区间带进当前文档的批量提交
+      if (reqSeq.current !== seq || docIdRef.current !== docId) return
       setMatches(data.matches)
       // 默认全选，便于直接批量编码；可再逐项取消
       setChecked(new Set(data.matches.map((_, i) => i)))
     } catch (e) {
-      onError(e)
+      if (reqSeq.current === seq && docIdRef.current === docId) onError(e)
     } finally {
-      setSearching(false)
+      if (reqSeq.current === seq && docIdRef.current === docId) setSearching(false)
     }
   }
 
@@ -77,13 +87,15 @@ export default function SearchBatchPanel({ docId, codes, onApplied, onError }) {
         code_id: Number(codeChoice),
         items: selectedItems.map((m) => ({ start: m.start, end: m.end })),
       })
-      setResult(data)
+      // 提交在途期间切换文档：写入目标仍是检索时的文档（与命中区间一致），
+      // 仅结果展示随切换失效
+      if (docIdRef.current === docId) setResult(data)
       await onApplied()
     } catch (e) {
       // 任一非法项时后端整批回滚，这里只提示，无需本地清理
       onError(e)
     } finally {
-      setApplying(false)
+      if (docIdRef.current === docId) setApplying(false)
     }
   }
 

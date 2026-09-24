@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import TextView from './components/TextView'
 import CodingForm from './components/CodingForm'
@@ -15,6 +15,22 @@ import ImportDialog from './components/ImportDialog'
 import MigrationDialog from './components/MigrationDialog'
 import MemoView from './components/MemoView'
 import { codePointLength, codePointSlice } from './textIndex'
+
+/**
+ * 请求次序守卫：每个加载器持有一个单调序号，发起请求时取号，响应落地前
+ * 校验是否仍是最新一次。跨文档切换或连续刷新时，迟到的旧响应一律丢弃，
+ * 只展示当前文档最新一次请求的结果。
+ */
+function useRequestOrder() {
+  const seqRef = useRef(0)
+  return useMemo(
+    () => ({
+      next: () => ++seqRef.current,
+      isLatest: (seq) => seq === seqRef.current,
+    }),
+    []
+  )
+}
 
 export default function App() {
   const [docs, setDocs] = useState([])
@@ -59,29 +75,53 @@ export default function App() {
   const [memoLoading, setMemoLoading] = useState(false)
   const [memoError, setMemoError] = useState(null)
 
+  // 文档异步次序：currentDocRef 始终指向当前文档；docReqSeq / codesReqSeq
+  // 分别为文档读取与编码本读取的单调序号，只允许最新一次请求落地结果
+  const currentDocRef = useRef(null)
+  const docReqSeq = useRef(0)
+  const codesReqSeq = useRef(0)
+
+  // 各文档作用域统计 / 复核 / 备忘录加载器的请求次序守卫：
+  // 切换文档或连续刷新时，迟到的旧响应一律丢弃
+  const coocOrder = useRequestOrder()
+  const speakerOrder = useRequestOrder()
+  const distOrder = useRequestOrder()
+  const gapOrder = useRequestOrder()
+  const transOrder = useRequestOrder()
+  const reviewOrder = useRequestOrder()
+  const memoOrder = useRequestOrder()
+
   const showError = useCallback((e) => {
     setError(e.message || String(e))
     setTimeout(() => setError(null), 5000)
   }, [])
 
   const loadCodes = useCallback(async () => {
+    const seq = ++codesReqSeq.current
     try {
-      setCodebook(await api.listCodes())
+      const data = await api.listCodes()
+      if (seq === codesReqSeq.current) setCodebook(data)
     } catch (e) {
-      showError(e)
+      if (seq === codesReqSeq.current) showError(e)
     }
   }, [showError])
 
-  const loadDocument = useCallback(
-    async (id) => {
-      try {
-        setDocData(await api.getDocument(id))
-      } catch (e) {
-        showError(e)
+  // 文档读取始终针对「当前文档」：响应落地前同时校验请求次序与当前文档，
+  // 切到 B 后迟到的 A 响应、被更新请求取代的旧响应一律丢弃，正文与标注
+  // 只展示当前文档的最新结果
+  const loadDocument = useCallback(async () => {
+    const id = currentDocRef.current
+    if (id == null) return
+    const seq = ++docReqSeq.current
+    try {
+      const data = await api.getDocument(id)
+      if (seq === docReqSeq.current && id === currentDocRef.current) {
+        setDocData(data)
       }
-    },
-    [showError]
-  )
+    } catch (e) {
+      if (seq === docReqSeq.current && id === currentDocRef.current) showError(e)
+    }
+  }, [showError])
 
   useEffect(() => {
     ;(async () => {
@@ -97,21 +137,40 @@ export default function App() {
   }, [loadCodes, showError])
 
   useEffect(() => {
-    if (docId != null) {
-      setEditing(null)
-      setSelection(null)
-      // 跨文档定位的待定位片段指向新文档本身，需保留；其余情况清除
-      setPendingLocate((cur) => (cur && cur.docId === docId ? cur : null))
-      // 备忘录数据按文档隔离：切文档后回到备忘录标签时重新加载
-      setMemoData(null)
-      setMemoError(null)
-      loadDocument(docId)
-    }
+    if (docId == null) return
+    currentDocRef.current = docId
+    // 切换加载期间清空旧文档数据：正文 / 侧栏 / 表单整体卸载，
+    // 不会用旧正文、旧标注或旧表单状态操作新文档
+    setDocData(null)
+    setEditing(null)
+    setSelection(null)
+    // 冲突确认若跨过文档切换：随冲突预览一并失效
+    setConflict(null)
+    // 跨文档定位的待定位片段指向新文档本身，需保留；其余情况清除
+    setPendingLocate((cur) => (cur && cur.docId === docId ? cur : null))
+    // 各文档作用域的统计 / 复核数据随切换清空，新结果到达前不展示旧文档结果
+    setCoocStats(null)
+    setCoocError(null)
+    setSpeakerStats(null)
+    setSpeakerError(null)
+    setDistStats(null)
+    setDistError(null)
+    setGapStats(null)
+    setGapError(null)
+    setTransStats(null)
+    setTransError(null)
+    setReviewData(null)
+    setReviewError(null)
+    // 备忘录数据按文档隔离：切文档后回到备忘录标签时重新加载
+    setMemoData(null)
+    setMemoError(null)
+    loadDocument()
   }, [docId, loadDocument])
 
   const refresh = useCallback(async () => {
-    await Promise.all([loadDocument(docId), loadCodes()])
-  }, [docId, loadDocument, loadCodes])
+    // 无参：始终重读「当前文档」；loadDocument 内部还会再做一次次序校验
+    await Promise.all([loadDocument(), loadCodes()])
+  }, [loadDocument, loadCodes])
 
   // 迁移会改动正文长度与文档标注数：同时刷新文档列表（顶栏计数）
   const refreshAfterMigration = useCallback(async () => {
@@ -127,6 +186,7 @@ export default function App() {
 
   const loadCooccurrence = useCallback(async () => {
     if (docId == null) return
+    const seq = coocOrder.next()
     // 全部编码被取消勾选：直接给空结果，不请求后端
     if (filteredCodeIds && filteredCodeIds.length === 0) {
       setCoocStats({ document_id: docId, codes: [], pairs: [] })
@@ -137,15 +197,18 @@ export default function App() {
     setCoocLoading(true)
     setCoocError(null)
     try {
-      setCoocStats(await api.getCooccurrence(docId, filteredCodeIds))
+      const data = await api.getCooccurrence(docId, filteredCodeIds)
+      if (coocOrder.isLatest(seq)) setCoocStats(data)
     } catch (e) {
-      setCoocStats(null)
-      setCoocError(e.message || String(e))
+      if (coocOrder.isLatest(seq)) {
+        setCoocStats(null)
+        setCoocError(e.message || String(e))
+      }
     } finally {
-      setCoocLoading(false)
+      if (coocOrder.isLatest(seq)) setCoocLoading(false)
     }
     // docData 变化（新建/编辑/删除标注后 refresh）也要重新统计
-  }, [docId, filteredCodeIds, docData])
+  }, [docId, filteredCodeIds, docData, coocOrder])
 
   useEffect(() => {
     loadCooccurrence()
@@ -155,19 +218,23 @@ export default function App() {
 
   const loadSpeakers = useCallback(async () => {
     if (docId == null) return
+    const seq = speakerOrder.next()
     // 编码全部取消勾选时传空数组：后端仅返回文本长度统计，不带编码列
     setSpeakerLoading(true)
     setSpeakerError(null)
     try {
-      setSpeakerStats(await api.getSpeakerStats(docId, filteredCodeIds))
+      const data = await api.getSpeakerStats(docId, filteredCodeIds)
+      if (speakerOrder.isLatest(seq)) setSpeakerStats(data)
     } catch (e) {
-      setSpeakerStats(null)
-      setSpeakerError(e.message || String(e))
+      if (speakerOrder.isLatest(seq)) {
+        setSpeakerStats(null)
+        setSpeakerError(e.message || String(e))
+      }
     } finally {
-      setSpeakerLoading(false)
+      if (speakerOrder.isLatest(seq)) setSpeakerLoading(false)
     }
     // docData 变化（新建/编辑/删除标注后 refresh）也要重新统计
-  }, [docId, filteredCodeIds, docData])
+  }, [docId, filteredCodeIds, docData, speakerOrder])
 
   useEffect(() => {
     loadSpeakers()
@@ -176,19 +243,23 @@ export default function App() {
   // ---------- 跨文档编码分布对比（随编码筛选与标注变化同步） ----------
 
   const loadDistribution = useCallback(async () => {
+    const seq = distOrder.next()
     // 与说话人分析一致：编码全部取消勾选时传空数组，后端仅返回文档列表
     setDistLoading(true)
     setDistError(null)
     try {
-      setDistStats(await api.getCodeDistribution(filteredCodeIds))
+      const data = await api.getCodeDistribution(filteredCodeIds)
+      if (distOrder.isLatest(seq)) setDistStats(data)
     } catch (e) {
-      setDistStats(null)
-      setDistError(e.message || String(e))
+      if (distOrder.isLatest(seq)) {
+        setDistStats(null)
+        setDistError(e.message || String(e))
+      }
     } finally {
-      setDistLoading(false)
+      if (distOrder.isLatest(seq)) setDistLoading(false)
     }
     // docData 变化（新建/编辑/删除标注后 refresh）也要重新统计
-  }, [filteredCodeIds, docData])
+  }, [filteredCodeIds, docData, distOrder])
 
   useEffect(() => {
     loadDistribution()
@@ -198,19 +269,23 @@ export default function App() {
 
   const loadGaps = useCallback(async () => {
     if (docId == null) return
+    const seq = gapOrder.next()
     // 与说话人分析一致：编码全部取消勾选时传空数组，全文即一个缺口
     setGapLoading(true)
     setGapError(null)
     try {
-      setGapStats(await api.getGaps(docId, filteredCodeIds))
+      const data = await api.getGaps(docId, filteredCodeIds)
+      if (gapOrder.isLatest(seq)) setGapStats(data)
     } catch (e) {
-      setGapStats(null)
-      setGapError(e.message || String(e))
+      if (gapOrder.isLatest(seq)) {
+        setGapStats(null)
+        setGapError(e.message || String(e))
+      }
     } finally {
-      setGapLoading(false)
+      if (gapOrder.isLatest(seq)) setGapLoading(false)
     }
     // docData 变化（新建/编辑/删除标注后 refresh）也要重新统计
-  }, [docId, filteredCodeIds, docData])
+  }, [docId, filteredCodeIds, docData, gapOrder])
 
   useEffect(() => {
     loadGaps()
@@ -220,19 +295,23 @@ export default function App() {
 
   const loadTransitions = useCallback(async () => {
     if (docId == null) return
+    const seq = transOrder.next()
     // 与说话人分析一致：编码全部取消勾选时传空数组，无状态区间与转移
     setTransLoading(true)
     setTransError(null)
     try {
-      setTransStats(await api.getTransitions(docId, filteredCodeIds))
+      const data = await api.getTransitions(docId, filteredCodeIds)
+      if (transOrder.isLatest(seq)) setTransStats(data)
     } catch (e) {
-      setTransStats(null)
-      setTransError(e.message || String(e))
+      if (transOrder.isLatest(seq)) {
+        setTransStats(null)
+        setTransError(e.message || String(e))
+      }
     } finally {
-      setTransLoading(false)
+      if (transOrder.isLatest(seq)) setTransLoading(false)
     }
     // docData 变化（新建/编辑/删除标注后 refresh）也要重新统计
-  }, [docId, filteredCodeIds, docData])
+  }, [docId, filteredCodeIds, docData, transOrder])
 
   useEffect(() => {
     loadTransitions()
@@ -242,18 +321,22 @@ export default function App() {
 
   const loadReview = useCallback(async () => {
     if (docId == null) return
+    const seq = reviewOrder.next()
     setReviewLoading(true)
     setReviewError(null)
     try {
-      setReviewData(await api.getReview(docId))
+      const data = await api.getReview(docId)
+      if (reviewOrder.isLatest(seq)) setReviewData(data)
     } catch (e) {
-      setReviewData(null)
-      setReviewError(e.message || String(e))
+      if (reviewOrder.isLatest(seq)) {
+        setReviewData(null)
+        setReviewError(e.message || String(e))
+      }
     } finally {
-      setReviewLoading(false)
+      if (reviewOrder.isLatest(seq)) setReviewLoading(false)
     }
     // docData 变化（标注增删改 / 迁移）后重新读取批次的 stale 标记
-  }, [docId, docData])
+  }, [docId, docData, reviewOrder])
 
   useEffect(() => {
     loadReview()
@@ -261,22 +344,32 @@ export default function App() {
 
   // ---------- 分析备忘录（在办 / 已归档两个分区，进入标签时加载） ----------
 
+  // 与 loadDocument 同口径：始终读取「当前文档」，旧闭包迟到的调用也只会
+  // 重读当前文档，不会把上一篇文档的备忘录写回界面
   const loadMemos = useCallback(async () => {
-    if (docId == null) return
+    const id = currentDocRef.current
+    if (id == null) return
+    const seq = memoOrder.next()
     setMemoLoading(true)
     setMemoError(null)
     try {
       const [active, archived] = await Promise.all([
-        api.listMemos(docId, 'active'),
-        api.listMemos(docId, 'archived'),
+        api.listMemos(id, 'active'),
+        api.listMemos(id, 'archived'),
       ])
-      setMemoData({ active: active.memos, archived: archived.memos })
+      if (memoOrder.isLatest(seq) && id === currentDocRef.current) {
+        setMemoData({ active: active.memos, archived: archived.memos })
+      }
     } catch (e) {
-      setMemoError(e.message || String(e))
+      if (memoOrder.isLatest(seq) && id === currentDocRef.current) {
+        setMemoError(e.message || String(e))
+      }
     } finally {
-      setMemoLoading(false)
+      if (memoOrder.isLatest(seq) && id === currentDocRef.current) {
+        setMemoLoading(false)
+      }
     }
-  }, [docId])
+  }, [memoOrder])
 
   // 首次进入备忘录标签时加载；在标签页内发生任何备忘录操作后再进来也刷新
   useEffect(() => {
@@ -296,8 +389,9 @@ export default function App() {
 
   // ---------- 编码创建 / 编辑（含冲突检测） ----------
 
+  // payload 携带提交时捕获的目标文档：提交目标始终与预览正文所属文档一致
   async function doSubmit(payload, resolution) {
-    const { codeId, start, end, editing: editTarget } = payload
+    const { docId: targetDocId, codeId, start, end, editing: editTarget } = payload
     if (editTarget) {
       await api.updateCoding(editTarget.id, {
         code_id: codeId,
@@ -307,7 +401,7 @@ export default function App() {
       })
     } else {
       await api.createCoding({
-        document_id: docId,
+        document_id: targetDocId,
         code_id: codeId,
         start,
         end,
@@ -321,22 +415,34 @@ export default function App() {
   }
 
   async function handleSubmit({ codeId, newCodeName, start, end, editing: editTarget }) {
+    // 捕获提交时的目标文档与正文快照：预览 / 冲突确认 / 提交全程以它为准
+    const targetDocId = docId
+    if (targetDocId == null) return
+    // 编辑目标必须属于当前文档的标注集合，防止跨文档错位提交
+    if (editTarget && !(docData?.codings ?? []).some((c) => c.id === editTarget.id)) {
+      setEditing(null)
+      showError(new Error('编辑目标已不属于当前文档，请重新选择'))
+      return
+    }
+    const contentSnapshot = docData?.document?.content ?? null
     try {
       let finalCodeId = codeId
       if (newCodeName) {
         const created = await api.createCode(newCodeName)
         finalCodeId = created.id
       }
-      const payload = { codeId: finalCodeId, start, end, editing: editTarget }
+      const payload = { docId: targetDocId, codeId: finalCodeId, start, end, editing: editTarget }
       const preview = await api.previewCoding({
-        document_id: docId,
+        document_id: targetDocId,
         code_id: finalCodeId,
         start,
         end,
         exclude_id: editTarget ? editTarget.id : null,
       })
+      // 预览在途期间发生文档切换：预览失效，不弹冲突框也不静默提交
+      if (currentDocRef.current !== targetDocId) return
       if (preview.has_conflicts) {
-        setConflict({ preview, payload })
+        setConflict({ docId: targetDocId, preview, payload, content: contentSnapshot })
       } else {
         await doSubmit(payload, 'keep')
       }
@@ -346,6 +452,12 @@ export default function App() {
   }
 
   async function handleResolve(resolution) {
+    // 冲突确认若已跨过文档切换（切换时 conflict 已清空）不会触发；
+    // 这里再校验一次，确认目标仍是预览时的文档
+    if (!conflict || conflict.docId !== currentDocRef.current) {
+      setConflict(null)
+      return
+    }
     try {
       await doSubmit(conflict.payload, resolution)
     } catch (e) {
@@ -414,10 +526,16 @@ export default function App() {
 
   // ---------- 标注抽样复核 ----------
 
+  // 复核写操作的目标文档在点击时确定；响应到达时若已切走，只完成写入，
+  // 不把旧文档的批次数据展示到新文档上
   async function handleCreateReview(codeSettings) {
+    const targetDocId = docId
     try {
-      setReviewData(await api.createReview(docId, codeSettings))
-      setReviewError(null)
+      const data = await api.createReview(targetDocId, codeSettings)
+      if (currentDocRef.current === targetDocId) {
+        setReviewData(data)
+        setReviewError(null)
+      }
     } catch (e) {
       showError(e)
       throw e
@@ -433,30 +551,39 @@ export default function App() {
       )
       if (!ok) return
     }
+    const targetDocId = docId
     try {
-      setReviewData(await api.createReview(docId, batch.codes.map((s) => ({
+      const data = await api.createReview(targetDocId, batch.codes.map((s) => ({
         code_id: s.code_id,
         sample_size: s.sample_size,
-      }))))
-      setReviewError(null)
+      })))
+      if (currentDocRef.current === targetDocId) {
+        setReviewData(data)
+        setReviewError(null)
+      }
     } catch (e) {
       showError(e)
     }
   }
 
   async function handleDeleteReview() {
+    const targetDocId = docId
     try {
-      await api.deleteReview(docId)
-      setReviewData({ batch: null })
+      await api.deleteReview(targetDocId)
+      if (currentDocRef.current === targetDocId) setReviewData({ batch: null })
     } catch (e) {
       showError(e)
     }
   }
 
   async function handlePatchReview(itemId, status, note) {
+    const targetDocId = docId
     try {
-      setReviewData(await api.updateReviewItem(docId, itemId, status, note))
-      setReviewError(null)
+      const data = await api.updateReviewItem(targetDocId, itemId, status, note)
+      if (currentDocRef.current === targetDocId) {
+        setReviewData(data)
+        setReviewError(null)
+      }
     } catch (e) {
       showError(e)
       throw e
@@ -614,7 +741,17 @@ export default function App() {
   }, [docData, visibleCodings])
 
   if (!docData) {
-    return <div className="loading">加载中…</div>
+    // 初始加载与文档切换加载期间：不渲染任何旧文档的正文 / 侧栏 / 表单
+    return (
+      <div className="loading">
+        <p>{error ?? '加载中…'}</p>
+        {error && (
+          <button className="primary-btn" onClick={loadDocument}>
+            重试
+          </button>
+        )}
+      </div>
+    )
   }
 
   const { document: doc, codings } = docData
@@ -858,7 +995,7 @@ export default function App() {
       {conflict && (
         <ConflictDialog
           preview={conflict.preview}
-          content={doc.content}
+          content={conflict.content ?? doc.content}
           onResolve={handleResolve}
           onCancel={() => setConflict(null)}
         />
